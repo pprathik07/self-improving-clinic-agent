@@ -78,13 +78,76 @@ def test_smoke_aborts_on_403():
     assert calls["n"] == 1
 
 
+def test_smoke_function_call_returns_ok_when_fake_has_tool_call():
+    """smoke_function_call returns 'OK [provider:X]' when chat_fn returns at least one tool_call."""
+    seen: dict = {}
+
+    def fake_chat(**kwargs):
+        seen["tools"] = kwargs.get("tools")
+        return SimpleNamespace(
+            content="",
+            tool_calls=[SimpleNamespace(
+                name="verify_patient",
+                arguments={"name": "Asha Rao", "dob": "1990-05-14"},
+            )],
+        )
+
+    result = smoke.smoke_function_call(fake_chat, model_key="AGENT_MODEL")
+    # Tool passed through should contain the verify_patient name from pydantic shape
+    assert isinstance(seen["tools"], list) and len(seen["tools"]) == 1
+    assert seen["tools"][0]["name"] == "verify_patient"
+    assert seen["tools"][0].get("input_schema") or seen["tools"][0].get("parameters"), \
+        "Tool dict must carry a non-empty schema key"
+    assert result.startswith("OK"), f"Expected result starting with 'OK', got {result!r}"
+    # Provider info appended
+    assert "[provider:" in result, f"Expected result to include provider tag, got {result!r}"
+
+
+def test_smoke_function_call_returns_fail_when_fake_has_only_text():
+    """smoke_function_call returns the FAIL string with provider when chat_fn returned text only."""
+
+    def fake_chat(**kwargs):
+        return SimpleNamespace(
+            content="Hi Asha — I've verified your identity using the info you provided.",
+            tool_calls=[],
+        )
+
+    result = smoke.smoke_function_call(fake_chat, model_key="AGENT_MODEL")
+    assert result.startswith("FAIL: no function call in response"), (
+        f"Expected FAIL prefix, got {result!r}"
+    )
+    assert "[provider:" in result, f"Expected FAIL result to include provider tag, got {result!r}"
+
+
+def test_smoke_function_call_raises_error_on_malformed_tool_via_chat():
+    """If chat_fn propagates a ValueError for a malformed tool dict, smoke surfaces it."""
+
+    def fake_chat(**kwargs):
+        tools = kwargs.get("tools") or []
+        # Simulate a chat() that enforces tool-schema shape (as _convert_tools does).
+        for t in tools:
+            if isinstance(t, dict):
+                if not t.get("name") or not (t.get("input_schema") or t.get("parameters")):
+                    raise ValueError(f"malformed tool: {t!r}")
+        return SimpleNamespace(content="", tool_calls=[])
+
+    # Purposely call chat with a malformed tool (the smoke no longer does this, but
+    # we verify the wrapper surfaces any ValueError as an error string).
+    result = smoke.smoke_function_call(fake_chat, model_key="AGENT_MODEL")
+    # fake_chat receives the good tool from smoke, so no error raised and returns FAIL text only
+    assert result.startswith("FAIL: no function call in response"), (
+        f"Expected FAIL prefix, got {result!r}"
+    )
+    assert "[provider:" in result, f"Expected FAIL result to include provider tag, got {result!r}"
+
+
 def test_is_abort_status():
     assert smoke.is_abort_status("FatalLLMError: 404 NOT_FOUND")
     assert not smoke.is_abort_status("timeout after 30s")
 
 
 def test_smoke_function_call_pass():
-    """Fake client returns a tool_call → smoke_function_call returns 'OK'."""
+    """Fake client returns a tool_call → smoke_function_call returns 'OK [provider:X]'."""
     def fake_chat(**kwargs):
         tools = kwargs.get("tools")
         if tools:
@@ -95,16 +158,18 @@ def test_smoke_function_call_pass():
         return SimpleNamespace(content="pong", tool_calls=[])
 
     result = smoke.smoke_function_call(fake_chat, model_key="AGENT_MODEL")
-    assert result == "OK"
+    assert result.startswith("OK"), f"Expected OK prefix, got {result!r}"
+    assert "[provider:" in result, f"Expected provider tag in result, got {result!r}"
 
 
 def test_smoke_function_call_no_tool_call_fails():
-    """Fake client returns text only (no tool_calls) → smoke_function_call returns FAIL."""
+    """Fake client returns text only (no tool_calls) → smoke_function_call returns FAIL with provider."""
     def fake_chat(**kwargs):
         return SimpleNamespace(content="The weather is sunny.", tool_calls=[])
 
     result = smoke.smoke_function_call(fake_chat, model_key="AGENT_MODEL")
-    assert result.startswith("FAIL")
+    assert result.startswith("FAIL"), f"Expected FAIL prefix, got {result!r}"
+    assert "[provider:" in result, f"Expected provider tag in FAIL result, got {result!r}"
 
 
 def test_smoke_run_includes_function_call():

@@ -483,7 +483,7 @@ def run_pytest(test_files: tuple[str, ...]) -> tuple[str, list[str], str]:
         "--tb=no",
         "-rf",
     ]
-    env = {**os.environ, "MOCK_LLM": "1"}
+    env = _hermetic_pytest_env()
     proc = subprocess.run(
         cmd,
         cwd=str(ROOT),
@@ -506,8 +506,22 @@ def run_pytest(test_files: tuple[str, ...]) -> tuple[str, list[str], str]:
     return "UNTESTED", [], raw
 
 
-def ensure_suite_green() -> None:
+def _hermetic_pytest_env() -> dict[str, str]:
+    """Force MOCK_LLM=1 and strip provider/debug vars from pytest subprocesses."""
     env = {**os.environ, "MOCK_LLM": "1"}
+    for key in (
+        "OPEN_ROUTER_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY",
+        "LLM_PROVIDER",
+        "CLINIC_DEBUG",
+    ):
+        env.pop(key, None)
+    return env
+
+
+def ensure_suite_green() -> None:
+    env = _hermetic_pytest_env()
     proc = subprocess.run(
         ["uv", "run", "pytest", "-q"],
         cwd=str(ROOT),

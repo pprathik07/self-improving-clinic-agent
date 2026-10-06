@@ -32,7 +32,7 @@ def models_are_distinct(env: dict[str, str] | None = None) -> tuple[bool, str]:
 
 
 def smoke_one(model_key: str, chat_fn) -> str:
-    """Call chat_fn once. Returns 'OK' or 'ErrorClass: message'."""
+    """Call chat_fn once. Returns 'OK [provider:X]' or 'ErrorClass: message'."""
     try:
         resp = chat_fn(
             messages=[{"role": "user", "content": "Reply with exactly: pong"}],
@@ -41,40 +41,45 @@ def smoke_one(model_key: str, chat_fn) -> str:
             max_tokens=16,
         )
         _ = getattr(resp, "content", None)
-        return "OK"
+        provider = getattr(resp, "provider", "") or "unknown"
+        return f"OK [provider:{provider}]"
     except Exception as e:
         return f"{type(e).__name__}: {e}"
 
 
 def smoke_function_call(chat_fn, model_key: str = "AGENT_MODEL") -> str:
-    """Send a request with a function declaration and verify a function call is returned.
+    """Send a request with one real agent tool schema and verify a function call is returned.
 
-    Returns 'OK' if the reply contains at least one function/tool call,
-    or an error string on failure. Never prints the API key.
+    Uses verify_patient from clinic_agent/tools/schemas.py in the exact shape the
+    agent uses (via pydantic_to_anthropic_tool), so the tool-schema cannot be
+    silently dropped by chat()'s tool converter. The user message explicitly
+    asks to verify Asha Rao DOB 1990-05-14 so the model has a clear reason to
+    emit a function call.
     """
-    _GET_WEATHER_TOOL = {
-        "name": "get_weather",
-        "description": "Get the current weather for a city.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "City name"},
-            },
-            "required": ["city"],
-        },
-    }
     try:
-        resp = chat_fn(
-            messages=[{"role": "user", "content": "What is the weather in Paris?"}],
-            system="You are a helpful assistant. Use the provided tools.",
-            tools=[_GET_WEATHER_TOOL],
-            model_key=model_key,
-            max_tokens=128,
+        from clinic_agent.llm import pydantic_to_anthropic_tool
+        from clinic_agent.tools.schemas import VerifyPatientArgs
+
+        tool = pydantic_to_anthropic_tool(
+            "verify_patient",
+            "Verify a patient's identity using their full name and date of birth.",
+            VerifyPatientArgs,
         )
+        resp = chat_fn(
+            messages=[{
+                "role": "user",
+                "content": "Please verify my identity. My full name is Asha Rao, and my date of birth is 1990-05-14.",
+            }],
+            system="You are a clinic scheduling assistant. Use the provided tools to verify the patient.",
+            tools=[tool],
+            model_key=model_key,
+            max_tokens=256,
+        )
+        provider = getattr(resp, "provider", "") or "unknown"
         tool_calls = getattr(resp, "tool_calls", [])
         if tool_calls and len(tool_calls) > 0:
-            return "OK"
-        return "FAIL: no function call in response"
+            return f"OK [provider:{provider}]"
+        return f"FAIL: no function call in response [provider:{provider}]"
     except Exception as e:
         return f"{type(e).__name__}: {e}"
 
@@ -105,10 +110,11 @@ def run_smoke(chat_fn=None, env: dict[str, str] | None = None) -> int:
         print(f"{key}={model} ...", end=" ", flush=True)
         result = smoke_one(key, chat_fn)
         print(result)
-        if result != "OK" and is_abort_status(result):
+        ok = result.startswith("OK")
+        if not ok and is_abort_status(result):
             print(f"Aborting on fatal auth/model error from {key}.")
             return 1
-        if result != "OK":
+        if not ok:
             return 1
 
     # Function-calling test on AGENT model
@@ -116,10 +122,11 @@ def run_smoke(chat_fn=None, env: dict[str, str] | None = None) -> int:
     print(f"Function call ({agent_model}) ...", end=" ", flush=True)
     fc_result = smoke_function_call(chat_fn, model_key="AGENT_MODEL")
     print(fc_result)
-    if fc_result != "OK" and is_abort_status(fc_result):
+    fc_ok = fc_result.startswith("OK")
+    if not fc_ok and is_abort_status(fc_result):
         print(f"Aborting on fatal auth/model error from function-call test.")
         return 1
-    if fc_result != "OK":
+    if not fc_ok:
         return 1
 
     return 0

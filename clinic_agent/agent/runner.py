@@ -20,12 +20,55 @@ from typing import Any
 from clinic_agent.agent.machine import get_allowed_tools, is_terminal, is_valid_transition
 from clinic_agent.agent.policy import load_policy, policy_to_prompt
 from clinic_agent.agent.state import AgentState, Message, PendingAction, SessionState
-from clinic_agent.clinic.db import frozen_now, init_db, seed_db
+from clinic_agent.clinic.db import frozen_now, init_db, reset_db, seed_db
 from clinic_agent.llm import LLMResponse, ToolCall, chat, pydantic_to_anthropic_tool
 from clinic_agent.tools.guards import GuardError
 from clinic_agent.tools.impl import TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
+
+
+def _clinic_debug_enabled() -> bool:
+    return os.environ.get("CLINIC_DEBUG", "0").strip() in {"1", "true", "True", "yes", "YES"}
+
+
+def _truncate(text: str, max_len: int = 200) -> str:
+    s = str(text)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+_STATE_HINTS = {
+    "SLOT_SELECTION": "Present the available slots and let the patient choose one. Do not book yet.",
+    "CONFIRM": "Do NOT call any tool. State the provider, date, time and reason, and ask the patient to reply yes to confirm.",
+    "EXECUTE": "The patient has confirmed. Call the booking, cancel or reschedule tool now.",
+}
+
+def _format_debug_events(events: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for ev in events:
+        kind = ev.get("type")
+        if kind == "tool_call":
+            lines.append(
+                f"[DEBUG] tool_call: {ev['name']}({json.dumps(ev['args'], sort_keys=True)})"
+            )
+            lines.append(f"[DEBUG]   result: {_truncate(ev['result'])}")
+        elif kind == "tool_blocked_state":
+            lines.append(
+                f"[DEBUG] tool_call: {ev['name']}({json.dumps(ev['args'], sort_keys=True)})"
+            )
+            lines.append(f"[DEBUG]   BLOCKED (state): {_truncate(ev['reason'])}")
+        elif kind == "tool_guard_blocked":
+            lines.append(
+                f"[DEBUG] tool_call: {ev['name']}({json.dumps(ev['args'], sort_keys=True)})"
+            )
+            lines.append(f"[DEBUG]   BLOCKED (guard): {_truncate(ev['reason'])}")
+        elif kind == "tool_error":
+            lines.append(
+                f"[DEBUG] tool_call: {ev['name']}({json.dumps(ev['args'], sort_keys=True)})"
+            )
+            lines.append(f"[DEBUG]   ERROR: {_truncate(ev['reason'])}")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +112,9 @@ def _build_system_prompt(policy_text: str, session: SessionState) -> str:
         f"- Confirmed: {session.confirmed}\n"
         f"- Today's date: {now.strftime('%A, %B %d, %Y')}\n"
         f"- Current time: {now.strftime('%I:%M %p')}\n"
+        f"- Confirmed: {session.confirmed}\n"
+        f"- What to do now: {_STATE_HINTS.get(session.state.value, '')}\n"
+        f"- Today's date: {now.strftime('%A, %B %d, %Y')}\n"        
     )
 
     return (
@@ -115,10 +161,13 @@ def run_turn(
     conn: Any,
     policy_text: str,
     trace: TraceLogger,
+    debug_events: list[dict] | None = None,
 ) -> str:
     """Run one agent turn: LLM call -> tool dispatch -> state transition.
 
     Returns the agent's text response to show the patient.
+    If debug_events is provided (list), every tool execution event is appended
+    to it for downstream per-turn printing (used when CLINIC_DEBUG=1).
     """
     # Build LLM inputs
     allowed = get_allowed_tools(session.state)
@@ -147,7 +196,7 @@ def run_turn(
 
     # Handle tool calls
     if response.tool_calls:
-        return _handle_tool_calls(response, session, conn, policy_text, trace)
+        return _handle_tool_calls(response, session, conn, policy_text, trace, debug_events)
 
     # Text-only response — add to history and return
     if response.content:
@@ -162,6 +211,7 @@ def _handle_tool_calls(
     conn: Any,
     policy_text: str,
     trace: TraceLogger,
+    debug_events: list[dict] | None = None,
 ) -> str:
     """Process tool calls from the LLM response."""
     results = []
@@ -170,15 +220,25 @@ def _handle_tool_calls(
     for tc in response.tool_calls:
         # Check if tool is allowed in current state
         if tc.name not in allowed:
+            reason = f"Not allowed in state {session.state.value}"
             result_text = f"Tool '{tc.name}' is not available right now. Please follow the current step."
             trace.log({
                 "event": "tool_blocked",
                 "tool": tc.name,
-                "reason": f"Not allowed in state {session.state.value}",
+                "reason": reason,
                 "session_state": session.snapshot(),
             })
+            if debug_events is not None:
+                debug_events.append({
+                    "type": "tool_blocked_state",
+                    "name": tc.name,
+                    "args": tc.arguments,
+                    "reason": reason,
+                })
         else:
-            result_text = _execute_tool(tc, session, conn, trace)
+            result_text, debug_evt = _execute_tool(tc, session, conn, trace)
+            if debug_events is not None and debug_evt is not None:
+                debug_events.append(debug_evt)
 
         results.append({
             "type": "tool_result",
@@ -234,10 +294,7 @@ def _handle_tool_calls(
 
     # If the followup also has tool calls, recurse (bounded by turn limit)
     if followup.tool_calls:
-        # Add followup content to messages and process its tool calls
-        if followup.content:
-            session.messages.append(Message(role="assistant", content=followup.content))
-        return _handle_tool_calls(followup, session, conn, policy_text, trace)
+        return _handle_tool_calls(followup, session, conn, policy_text, trace, debug_events)
 
     if followup.content:
         session.messages.append(Message(role="assistant", content=followup.content))
@@ -245,8 +302,16 @@ def _handle_tool_calls(
     return followup.content
 
 
-def _execute_tool(tc: ToolCall, session: SessionState, conn: Any, trace: TraceLogger) -> str:
-    """Execute a single tool call with guards."""
+def _execute_tool(
+    tc: ToolCall, session: SessionState, conn: Any, trace: TraceLogger
+) -> tuple[str, dict | None]:
+    """Execute a single tool call with guards.
+
+    Returns (result_text, debug_event_or_None). debug_event is None when the
+    caller hasn't requested debug logging (debug_events list was not supplied
+    to _handle_tool_calls) but we always compute it for the debug-events
+    machinery; the caller decides whether to include it.
+    """
     tool_fn, args_model = TOOL_REGISTRY[tc.name]
 
     try:
@@ -266,7 +331,13 @@ def _execute_tool(tc: ToolCall, session: SessionState, conn: Any, trace: TraceLo
             "session_state": pre_state,
         })
 
-        return result_text
+        debug_evt = {
+            "type": "tool_call",
+            "name": tc.name,
+            "args": tc.arguments,
+            "result": result_text,
+        }
+        return result_text, debug_evt
 
     except GuardError as e:
         trace.log({
@@ -276,7 +347,13 @@ def _execute_tool(tc: ToolCall, session: SessionState, conn: Any, trace: TraceLo
             "guard_error": e.internal_reason,
             "session_state": session.snapshot(),
         })
-        return json.dumps({"error": e.patient_message})
+        debug_evt = {
+            "type": "tool_guard_blocked",
+            "name": tc.name,
+            "args": tc.arguments,
+            "reason": e.internal_reason,
+        }
+        return json.dumps({"error": e.patient_message}), debug_evt
 
     except Exception as e:
         logger.exception("Tool execution error: %s", e)
@@ -287,9 +364,15 @@ def _execute_tool(tc: ToolCall, session: SessionState, conn: Any, trace: TraceLo
             "error": str(e),
             "session_state": session.snapshot(),
         })
+        debug_evt = {
+            "type": "tool_error",
+            "name": tc.name,
+            "args": tc.arguments,
+            "reason": str(e),
+        }
         return json.dumps({
             "error": "Something went wrong on our end. Let me connect you with a staff member."
-        })
+        }), debug_evt
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +461,12 @@ def run_interactive(policy_path: str | None = None) -> None:
     policy_text = policy_to_prompt(policy)
 
     conn = init_db(in_memory=False)
-    seed_db(conn, "default")
+    reset_db(conn, "default")
 
     session = SessionState()
     trace = TraceLogger()
+
+    debug_on = _clinic_debug_enabled()
 
     print("\nClinic Scheduling Agent")
     print("=" * 40)
@@ -391,8 +476,13 @@ def run_interactive(policy_path: str | None = None) -> None:
     session.messages.append(Message(role="user", content="Hello"))
     session.state = AgentState.IDENTIFY  # Move to IDENTIFY immediately
 
-    greeting = run_turn(session, conn, policy_text, trace)
-    print(f"Agent: {greeting}\n")
+    debug_events: list[dict] = [] if debug_on else None
+    greeting = run_turn(session, conn, policy_text, trace, debug_events=debug_events)
+    print(f"Agent: {greeting}")
+    if debug_on and debug_events:
+        for line in _format_debug_events(debug_events):
+            print(line)
+    print()
 
     while not is_terminal(session.state):
         try:
@@ -418,8 +508,13 @@ def run_interactive(policy_path: str | None = None) -> None:
         # Detect state transitions from user input
         _maybe_transition_from_user_input(session, user_input)
 
-        response_text = run_turn(session, conn, policy_text, trace)
-        print(f"Agent: {response_text}\n")
+        turn_debug: list[dict] = [] if debug_on else None
+        response_text = run_turn(session, conn, policy_text, trace, debug_events=turn_debug)
+        print(f"Agent: {response_text}")
+        if debug_on and turn_debug:
+            for line in _format_debug_events(turn_debug):
+                print(line)
+        print()
 
     if is_terminal(session.state):
         print(f"\n[Conversation ended — state: {session.state.value}]")
@@ -459,10 +554,17 @@ def _maybe_transition_from_user_input(session: SessionState, user_input: str) ->
 
     # SLOT_SELECTION → CONFIRM when patient picks a slot
     elif session.state == AgentState.SLOT_SELECTION:
-        if any(word in lower for word in ["first", "that one", "book", "go ahead",
-                                           "looks good", "please", "yes"]):
+        affirm = ["yes", "yeah", "yep", "sure", "go ahead", "confirm", "book it", "do it"]
+        pick = ["first", "that one", "book", "looks good", "please"]
+        last_assistant = next(
+            (m.content for m in reversed(session.messages) if m.role == "assistant" and m.content), ""
+        ).lower()
+        already_confirming = ("confirm" in last_assistant or "is that correct" in last_assistant)
+        if any(w in lower for w in affirm) and already_confirming:
+            session.confirmed = True
+            session.state = AgentState.EXECUTE
+        elif any(w in lower for w in affirm + pick):
             session.state = AgentState.CONFIRM
-
 
 # ---------------------------------------------------------------------------
 # Simulated mode (for evals)

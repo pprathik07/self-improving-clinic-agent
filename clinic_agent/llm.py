@@ -12,11 +12,82 @@ import json
 import logging
 import os
 import re
-from typing import Any
+import threading
+from collections import defaultdict
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Per-role provider usage tracking (records which provider served each chat call).
+#
+# Thread-local label stack lets callers tag groups of chat() calls with a role
+# (e.g. "agent", "sim", "judge", "reflector"). The singleton _provider_usage
+# dict collects every observed provider per role.
+# ---------------------------------------------------------------------------
+
+_tls = threading.local()
+
+_provider_usage: dict[str, set[str]] = defaultdict(set)
+_provider_usage_lock = threading.Lock()
+
+
+def _role_label_stack() -> list[str]:
+    if not hasattr(_tls, "role_stack"):
+        _tls.role_stack = []
+    return _tls.role_stack
+
+
+@contextmanager
+def chat_role_label(role: str) -> Iterator[None]:
+    """Context manager that labels every chat() call inside with ``role``.
+
+    Usage::
+
+        with chat_role_label("agent"):
+            run_turn(...)  # any chat() here tagged as "agent"
+    """
+    stack = _role_label_stack()
+    stack.append(role)
+    try:
+        yield
+    finally:
+        stack.pop()
+
+
+def _current_chat_role() -> str | None:
+    """Return the topmost role label, or None if no stack."""
+    stack = _role_label_stack()
+    return stack[-1] if stack else None
+
+
+def _record_provider_usage(provider: str) -> None:
+    """Record that ``provider`` served a chat call under the current role."""
+    if not provider:
+        return
+    role = _current_chat_role()
+    if role is None:
+        return
+    with _provider_usage_lock:
+        _provider_usage[role].add(provider)
+
+
+def snapshot_provider_usage() -> dict[str, list[str]]:
+    """Return a stable sorted snapshot of {role: [providers_used]}.
+
+    The dict is a copy; callers can mutate it freely.
+    """
+    with _provider_usage_lock:
+        return {role: sorted(vals) for role, vals in _provider_usage.items()}
+
+
+def clear_provider_usage() -> None:
+    """Reset usage registry (call at start of each eval run)."""
+    with _provider_usage_lock:
+        _provider_usage.clear()
 
 # Load .env early so MOCK_LLM is available at import time
 from dotenv import load_dotenv as _load_dotenv
@@ -55,20 +126,53 @@ class LLMResponse(BaseModel):
     # Opaque raw provider Content (with thought_signature etc.).
     # Kept for roundtripping; never serialised to traces/results.
     raw_content: Any = Field(default=None, exclude=True)
+    # Which provider actually served this request ("openrouter" or "gemini" or "mock").
+    # exclude=True so existing trace/results serialisation format does not change;
+    # callers that need it access the attribute directly.
+    provider: str = Field(default="", exclude=True)
 
 
 # ---------------------------------------------------------------------------
 # Tool definition helper
 # ---------------------------------------------------------------------------
 
+
+def _ensure_types():
+    """Ensure google.genai.types is importable, loading it lazily if needed.
+
+    The top of this module conditionally imports ``types`` only when
+    ``MOCK_LLM=0`` at module-import time. Direct tests of helpers such as
+    _convert_tools or pydantic_to_gemini_tool may run with MOCK_LLM=1 at
+    import time and still need real types classes to build / inspect
+    FunctionDeclaration / Tool / GenerateContentConfig objects. This loader
+    patches the missing binding into module globals on first access so we
+    never see ``NameError: name 'types' is not defined`` from those paths.
+    """
+    if "types" in globals() and isinstance(globals()["types"], type(__import__("types"))) is False:
+        # google.genai.types is already loaded (a module with FunctionDeclaration).
+        # isinstance check with stdlib types sentinel above is for lint only.
+        return globals()["types"]
+    if "types" not in globals():
+        try:
+            from google.genai import types as _loaded_types  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "google-genai not installed. Install with: uv add google-genai "
+                "or set MOCK_LLM=1 for testing without an API key."
+            ) from exc
+        globals()["types"] = _loaded_types
+    return globals()["types"]
+
+
 def pydantic_to_gemini_tool(name: str, description: str, args_model: type[BaseModel]) -> types.FunctionDeclaration:
     """Convert a Pydantic model into a Gemini FunctionDeclaration."""
+    _t = _ensure_types()
     schema = args_model.model_json_schema()
     # Clean up schema for Gemini
     schema.pop("title", None)
     schema.pop("$defs", None)
 
-    return types.FunctionDeclaration(
+    return _t.FunctionDeclaration(
         name=name,
         description=description,
         parameters=schema,
@@ -97,12 +201,345 @@ def _get_client() -> genai.Client:
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter (1st-choice provider; OpenAI-compatible REST via openai SDK)
+# ---------------------------------------------------------------------------
+
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+_openrouter_client: Any = None
+_openrouter_sdk_available: bool | None = None  # None = not checked yet
+
+
+def _openrouter_api_key() -> str | None:
+    """Return the OpenRouter API key if set, else None."""
+    key = os.environ.get("OPEN_ROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
+    return key or None
+
+
+def _ensure_openrouter_sdk() -> bool:
+    """Return True iff the openai SDK is importable (caches result)."""
+    global _openrouter_sdk_available
+    if _openrouter_sdk_available is not None:
+        return _openrouter_sdk_available
+    try:
+        import openai  # noqa: F401
+        _openrouter_sdk_available = True
+    except ImportError:
+        _openrouter_sdk_available = False
+    return _openrouter_sdk_available
+
+
+def _get_openrouter_client() -> Any:
+    """Lazily create the OpenRouter client. Returns None if no key / no SDK."""
+    global _openrouter_client
+    if _openrouter_api_key() is None:
+        return None
+    if not _ensure_openrouter_sdk():
+        return None
+    if _openrouter_client is None:
+        import openai
+        _openrouter_client = openai.OpenAI(
+            api_key=_openrouter_api_key(),
+            base_url=_OPENROUTER_BASE_URL,
+        )
+    return _openrouter_client
+
+
+def _openrouter_enabled() -> bool:
+    """True iff OpenRouter should be tried first (key present + SDK available)."""
+    return _openrouter_api_key() is not None and _ensure_openrouter_sdk()
+
+
+def _to_openrouter_tools(tools: list[dict]) -> list[dict[str, Any]]:
+    """Convert internal tool dicts to OpenRouter / OpenAI function-calling format."""
+    declarations: list[dict[str, Any]] = []
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise ValueError(
+                f"tool[{i}]: expected dict for OpenRouter conversion, "
+                f"got {type(tool).__name__!r}"
+            )
+        name = tool.get("name")
+        description = tool.get("description", "")
+        schema = tool.get("input_schema")
+        if schema is None and "parameters" in tool:
+            schema = tool["parameters"]
+        if not name or not isinstance(name, str):
+            raise ValueError(
+                f"tool[{i}]: 'name' (non-empty string) is required. "
+                f"Keys present: {sorted(tool.keys())!r}."
+            )
+        if not isinstance(schema, dict) or not schema:
+            raise ValueError(
+                f"tool[{i}] ({name!r}): missing argument schema. "
+                f"Provide 'input_schema' or 'parameters' as a non-empty dict. "
+                f"Keys present: {sorted(tool.keys())!r}."
+            )
+        declarations.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            },
+        })
+    return declarations
+
+
+def _to_openrouter_messages(
+    messages: list[dict[str, Any]], system: str
+) -> list[dict[str, Any]]:
+    """Convert internal + system prompt into OpenRouter chat completions messages list.
+
+    Tool results are emitted as SEPARATE messages with role="tool" and the
+    matching tool_call_id (per OpenAI/OpenRouter spec), not embedded inside
+    user content blocks. An assistant message with tool_calls is followed by
+    one "tool" role message per tool result.
+    """
+    out: list[dict[str, Any]] = []
+    if system:
+        out.append({"role": "system", "content": system})
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "user":
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                standalone_tool_results: list[dict[str, Any]] = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "tool_result":
+                        standalone_tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": item.get("tool_use_id", ""),
+                            "content": item.get("content", ""),
+                        })
+                    elif isinstance(item, dict) and item.get("type") == "text":
+                        t = item.get("text", "")
+                        if t:
+                            text_parts.append(t)
+                    else:
+                        text_parts.append(str(item))
+                if text_parts:
+                    out.append({"role": "user", "content": "\n".join(text_parts)})
+                for tr in standalone_tool_results:
+                    out.append(tr)
+            else:
+                if content:
+                    out.append({"role": "user", "content": str(content)})
+        elif role == "assistant":
+            raw = msg.get("_raw_content")
+            if isinstance(content, list):
+                text_buf: list[str] = []
+                tcalls: list[dict[str, Any]] = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            t = block.get("text", "")
+                            if t:
+                                text_buf.append(t)
+                        elif block.get("type") == "tool_use":
+                            tcalls.append({
+                                "id": block.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                },
+                            })
+                assistant_msg: dict[str, Any] = {"role": "assistant"}
+                if text_buf:
+                    assistant_msg["content"] = "\n".join(text_buf)
+                else:
+                    assistant_msg["content"] = ""
+                if tcalls:
+                    assistant_msg["tool_calls"] = tcalls
+                out.append(assistant_msg)
+            elif raw is not None:
+                out.append({"role": "assistant", "content": str(content or "")})
+            else:
+                out.append({"role": "assistant", "content": str(content or "")})
+        elif role == "tool_result":
+            out.append({
+                "role": "tool",
+                "tool_call_id": msg.get("tool_call_id", ""),
+                "content": str(msg.get("content", "")),
+            })
+        i += 1
+    return out
+
+
+def _parse_openrouter_response(response: Any) -> LLMResponse:
+    """Parse an OpenRouter / OpenAI chat completion into our typed LLMResponse."""
+    if not getattr(response, "choices", None):
+        return LLMResponse(content="", stop_reason="no_candidates")
+    choice = response.choices[0]
+    msg = getattr(choice, "message", None)
+    if msg is None:
+        return LLMResponse(content="", stop_reason=str(getattr(choice, "finish_reason", "no_message")))
+
+    content_text = getattr(msg, "content", None) or ""
+    tool_calls_out: list[ToolCall] = []
+    raw_tcalls = getattr(msg, "tool_calls", None) or []
+    for tc in raw_tcalls:
+        fn = getattr(tc, "function", None)
+        if fn is None:
+            continue
+        fname = getattr(fn, "name", "")
+        fargs_raw = getattr(fn, "arguments", "{}") or "{}"
+        try:
+            fargs = json.loads(fargs_raw) if isinstance(fargs_raw, str) else dict(fargs_raw)
+        except json.JSONDecodeError:
+            fargs = {"_raw": fargs_raw}
+        tool_calls_out.append(ToolCall(
+            id=getattr(tc, "id", f"call_{fname}"),
+            name=fname,
+            arguments=fargs,
+        ))
+
+    usage: dict[str, int] = {}
+    um = getattr(response, "usage", None)
+    if um is not None:
+        if getattr(um, "prompt_tokens", None) is not None:
+            usage["input_tokens"] = int(um.prompt_tokens) or 0
+        if getattr(um, "completion_tokens", None) is not None:
+            usage["output_tokens"] = int(um.completion_tokens) or 0
+
+    stop_reason = str(getattr(choice, "finish_reason", ""))
+    return LLMResponse(
+        content=content_text,
+        tool_calls=tool_calls_out,
+        usage=usage,
+        stop_reason=stop_reason,
+        raw_content=None,
+    )
+
+
+def _openrouter_chat(
+    messages: list[dict[str, Any]],
+    system: str,
+    tools: list[dict] | None,
+    model_key: str,
+    temperature: float,
+    max_tokens: int,
+) -> LLMResponse:
+    """Call OpenRouter with the same retry/abort policy as Gemini. Raises on error; caller decides fallback."""
+    client = _get_openrouter_client()
+    if client is None:
+        raise RuntimeError("OpenRouter client unavailable (no key or SDK missing)")
+    model = os.environ.get(model_key, "openrouter/auto")
+    api_msgs = _to_openrouter_messages(messages, system)
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": api_msgs,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        kwargs["tools"] = _to_openrouter_tools(tools)
+        kwargs["parallel_tool_calls"] = None
+    return _openrouter_generate_with_retries(client, kwargs)
+
+
+def _openrouter_generate_with_retries(client: Any, kwargs: dict[str, Any]) -> LLMResponse:
+    """OpenRouter chat.completions.create call with matching abort/retry policy."""
+    import time
+    last_error: BaseException | None = None
+    rate_failures = 0
+    server_failures = 0
+    while True:
+        try:
+            response = client.chat.completions.create(**kwargs)
+            return _parse_openrouter_response(response)
+        except Exception as e:
+            error_str = str(e)
+            if _is_rate_limit_error(e, error_str):
+                if _is_per_day_quota(e, error_str):
+                    raise FatalLLMError(
+                        f"LLM API per-day quota exhausted (abort): {e}"
+                    ) from e
+                if rate_failures >= 3:
+                    raise FatalLLMError(
+                        f"LLM API rate limit exhausted after retries: {e}"
+                    ) from e
+                is_pm, pm_delay = _is_per_minute_quota(e, error_str)
+                if is_pm and pm_delay is not None:
+                    delay = min(pm_delay + 1.0, float(_RETRY_DELAY_CAP_S))
+                else:
+                    hinted = _extract_retry_delay_seconds(e)
+                    if hinted is not None:
+                        if hinted > _RETRY_DELAY_CAP_S:
+                            raise FatalLLMError(
+                                f"LLM API retry delay {hinted}s exceeds cap: {e}"
+                            ) from e
+                        delay = min(float(hinted), float(_RETRY_DELAY_CAP_S))
+                    else:
+                        delay = float(_RATE_LIMIT_SLEEPS[rate_failures])
+                logger.warning(
+                    "Rate limit (failure %d/3), sleeping %ss: %s",
+                    rate_failures + 1, delay, e,
+                )
+                time.sleep(delay)
+                rate_failures += 1
+                last_error = e
+                continue
+            if _is_immediate_abort_error(e, error_str):
+                raise FatalLLMError(
+                    f"LLM API fatal error (abort immediately): {e}. "
+                    f"Check your API keys and model IDs in .env. "
+                    f"Set MOCK_LLM=1 for testing without an API key."
+                ) from e
+            if _is_transient_server_error(e, error_str):
+                    if server_failures >= len(_SERVER_ERROR_SLEEPS):
+                        raise RuntimeError(
+                            f"LLM server error after {server_failures + 1} attempts "
+                            f"(slept {list(_SERVER_ERROR_SLEEPS)}s): {last_error or e}"
+                        ) from e
+                    delay = _SERVER_ERROR_SLEEPS[server_failures]
+                    server_failures += 1
+                    last_error = e
+                    logger.warning(
+                        "LLM server error (attempt %d/%d), sleeping %ds: %s",
+                        server_failures, len(_SERVER_ERROR_SLEEPS) + 1, delay, e,
+                    )
+                    time.sleep(delay)
+                    continue
+            raise
+
+
+# ---------------------------------------------------------------------------
 # Chat function
 # ---------------------------------------------------------------------------
 
 def _is_mock() -> bool:
     """Check MOCK_LLM at call time, not import time."""
     return os.environ.get("MOCK_LLM", "0") == "1"
+
+
+_LLM_PROVIDER_VALUES = {"auto", "openrouter", "gemini"}
+
+
+def _llm_provider_env() -> str:
+    """Return normalised LLM_PROVIDER env value (default 'auto').
+
+    Raises ValueError on any unrecognised non-empty value so misconfigurations
+    fail loudly instead of silently falling back.
+    """
+    raw = os.environ.get("LLM_PROVIDER", "auto").strip().lower()
+    if not raw:
+        return "auto"
+    if raw not in _LLM_PROVIDER_VALUES:
+        raise ValueError(
+            f"Invalid LLM_PROVIDER={raw!r}. Expected one of "
+            f"{sorted(_LLM_PROVIDER_VALUES)!r}."
+        )
+    return raw
+
+
+def _resolve_model_name(model_key: str, default: str) -> str:
+    """Resolve the user-facing model name for logging. Returns env[model_key] or default."""
+    return os.environ.get(model_key, default)
 
 
 def chat(
@@ -115,22 +552,105 @@ def chat(
 ) -> LLMResponse:
     """Send a chat request to the LLM.
 
+    LLM_PROVIDER env controls the provider selection:
+      - ``"auto"`` (default): OpenRouter first (if configured + SDK available),
+        fallback to Gemini on any non-fatal error. Each fallback logs a
+        WARNING naming the attempted and actual provider model.
+      - ``"openrouter"`` (explicit): ONLY OpenRouter. Any error (including
+        config missing) raises — **never** falls back to Gemini.
+      - ``"gemini"`` (explicit): ONLY Gemini. Any error raises — **never**
+        falls back to OpenRouter.
+
+    The returned LLMResponse.provider is populated with the provider that
+    actually served the request ("openrouter" | "gemini" | "mock"). It is
+    excluded from Pydantic serialisation so traces/results shape is stable.
+
     Args:
-        messages: Conversation messages (will be converted to Gemini format).
+        messages: Conversation messages (provider-specific conversion applied).
         system: System prompt text.
-        tools: Tool definitions (Gemini FunctionDeclarations or dicts).
+        tools: Tool definitions (dicts with name/description/input_schema or parameters).
         model_key: Env var name for the model to use.
         temperature: Sampling temperature.
         max_tokens: Maximum response tokens.
 
     Returns:
-        Typed LLMResponse with content, tool calls, and usage.
+        Typed LLMResponse with content, tool calls, usage, and .provider set.
 
     Raises:
         RuntimeError on timeout or unrecoverable error (after retries).
+        FatalLLMError on auth / quota abort errors (from whichever provider ran).
+        ValueError on invalid LLM_PROVIDER value or explicit provider unavailable.
     """
+    provider_mode = _llm_provider_env()
     if _is_mock():
-        return _mock_chat(messages, system, tools, model_key)
+        resp = _mock_chat(messages, system, tools, model_key)
+        resp.provider = "mock"
+        _record_provider_usage("mock")
+        return resp
+
+    if provider_mode == "openrouter":
+        # Explicit: never fall back. If missing config, raise loudly.
+        if not _openrouter_enabled():
+            raise RuntimeError(
+                "LLM_PROVIDER=openrouter is set but OpenRouter is not available: "
+                + ("missing OPEN_ROUTER_API_KEY / OPENROUTER_API_KEY."
+                   if not _openrouter_api_key()
+                   else "openai SDK is not installed (pip install openai).")
+            )
+        resp = _openrouter_chat(
+            messages, system, tools, model_key, temperature, max_tokens,
+        )
+        resp.provider = "openrouter"
+        _record_provider_usage("openrouter")
+        return resp
+
+    if provider_mode == "gemini":
+        # Explicit: never fall back to OpenRouter.
+        resp = _chat_gemini(
+            messages, system, tools, model_key, temperature, max_tokens,
+        )
+        resp.provider = "gemini"
+        _record_provider_usage("gemini")
+        return resp
+
+    # provider_mode == "auto"
+    attempted_model = _resolve_model_name(model_key, "openrouter/auto")
+    if _openrouter_enabled():
+        try:
+            resp = _openrouter_chat(
+                messages, system, tools, model_key, temperature, max_tokens,
+            )
+            resp.provider = "openrouter"
+            _record_provider_usage("openrouter")
+            return resp
+        except FatalLLMError:
+            raise
+        except Exception as first_err:
+            fallback_model = _resolve_model_name(model_key, "gemini-2.0-flash")
+            logger.warning(
+                "Falling back from OpenRouter (model=%s) to Gemini (model=%s) after error: %s",
+                attempted_model, fallback_model, first_err,
+            )
+    resp = _chat_gemini(
+        messages, system, tools, model_key, temperature, max_tokens,
+    )
+    resp.provider = "gemini"
+    _record_provider_usage("gemini")
+    return resp
+
+
+def _chat_gemini(
+    messages: list[dict[str, Any]],
+    system: str,
+    tools: list[dict] | None,
+    model_key: str,
+    temperature: float,
+    max_tokens: int,
+) -> LLMResponse:
+    """Gemini-only inner call (shared by explicit 'gemini' mode and auto fallback).
+
+    Does NOT set LLMResponse.provider — caller sets it.
+    """
     client = _get_client()
     model = os.environ.get(model_key, "gemini-2.0-flash")
 
@@ -148,13 +668,15 @@ def chat(
 
     if tools:
         # Convert tool dicts to FunctionDeclaration objects if needed
-        gemini_tools = _convert_tools(tools)
+        _t = _ensure_types()
+        gemini_tools = _convert_tools(tools, _types=_t)
         config_kwargs["tools"] = gemini_tools
-        config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
+        config_kwargs["automatic_function_calling"] = _t.AutomaticFunctionCallingConfig(
             disable=True
         )
 
-    config = types.GenerateContentConfig(**config_kwargs)
+    _t_config = globals().get("types") or _ensure_types()
+    config = _t_config.GenerateContentConfig(**config_kwargs)
 
     return _generate_with_retries(client, model, contents, config)
 
@@ -188,7 +710,7 @@ def _extract_quota_info(exc: BaseException) -> dict[str, Any]:
         atype = obj.get("@type", "")
         if "QuotaFailure" in atype:
             for v in obj.get("violations", []):
-                qid = v.get("quotaMetric") or v.get("quotaId") or ""
+                qid = v.get("quotaId") or v.get("quotaMetric") or ""
                 if qid:
                     info["quota_id"] = qid
         if "RetryInfo" in atype:
@@ -237,6 +759,8 @@ def _is_immediate_abort_error(exc: BaseException, error_str: str) -> bool:
     )):
         return True
     if "NOT_FOUND" in s and re.search(r"\bmodel\b", error_str, re.I):
+        return True
+    if re.search(r"daily\s*quota|quota.*daily", error_str, re.I):
         return True
     return False
 
@@ -455,8 +979,9 @@ def _parse_response(response: Any) -> LLMResponse:
 # Message format conversion
 # ---------------------------------------------------------------------------
 
-def _to_gemini_contents(messages: list[dict[str, Any]]) -> list[types.Content]:
+def _to_gemini_contents(messages: list[dict[str, Any]]) -> list[Any]:
     """Convert our internal message format to Gemini Content objects."""
+    _t = _ensure_types()
     contents = []
 
     for msg in messages:
@@ -478,20 +1003,20 @@ def _to_gemini_contents(messages: list[dict[str, Any]]) -> list[types.Content]:
                             result_data = json.loads(result_content) if isinstance(result_content, str) else result_content
                         except json.JSONDecodeError:
                             result_data = {"result": result_content}
-                        parts.append(types.Part.from_function_response(
+                        parts.append(_t.Part.from_function_response(
                             name=tool_name,
                             response=result_data,
                         ))
                     elif isinstance(item, dict) and item.get("type") == "text":
-                        parts.append(types.Part.from_text(text=item.get("text", "")))
+                        parts.append(_t.Part.from_text(text=item.get("text", "")))
                     else:
-                        parts.append(types.Part.from_text(text=str(item)))
+                        parts.append(_t.Part.from_text(text=str(item)))
                 if parts:
-                    contents.append(types.Content(role="user", parts=parts))
+                    contents.append(_t.Content(role="user", parts=parts))
             else:
-                contents.append(types.Content(
+                contents.append(_t.Content(
                     role="user",
-                    parts=[types.Part.from_text(text=str(content))],
+                    parts=[_t.Part.from_text(text=str(content))],
                 ))
 
         elif role == "assistant":
@@ -508,23 +1033,23 @@ def _to_gemini_contents(messages: list[dict[str, Any]]) -> list[types.Content]:
                         if block.get("type") == "text":
                             text = block.get("text", "")
                             if text:
-                                parts.append(types.Part.from_text(text=text))
+                                parts.append(_t.Part.from_text(text=text))
                         elif block.get("type") == "tool_use":
-                            parts.append(types.Part(
-                                function_call=types.FunctionCall(
+                            parts.append(_t.Part(
+                                function_call=_t.FunctionCall(
                                     name=block.get("name", ""),
                                     args=block.get("input", {}),
                                 )
                             ))
                     else:
-                        parts.append(types.Part.from_text(text=str(block)))
+                        parts.append(_t.Part.from_text(text=str(block)))
                 if parts:
-                    contents.append(types.Content(role="model", parts=parts))
+                    contents.append(_t.Content(role="model", parts=parts))
             else:
                 if content:
-                    contents.append(types.Content(
+                    contents.append(_t.Content(
                         role="model",
-                        parts=[types.Part.from_text(text=str(content))],
+                        parts=[_t.Part.from_text(text=str(content))],
                     ))
 
     return contents
@@ -538,24 +1063,58 @@ def _extract_tool_name_from_id(tool_use_id: str) -> str:
     return tool_use_id or "unknown_tool"
 
 
-def _convert_tools(tools: list) -> list[types.Tool]:
-    """Convert tool definitions to Gemini format."""
-    declarations = []
-    for tool in tools:
-        if isinstance(tool, types.FunctionDeclaration):
-            declarations.append(tool)
-        elif isinstance(tool, dict):
-            # Convert from Anthropic-style dict to Gemini FunctionDeclaration
-            name = tool.get("name", "")
-            description = tool.get("description", "")
-            schema = tool.get("input_schema", {})
-            declarations.append(types.FunctionDeclaration(
-                name=name,
-                description=description,
-                parameters=schema,
-            ))
+def _convert_tools(tools: list, _types=None) -> list[Any]:
+    """Convert tool definitions to Gemini format.
 
-    return [types.Tool(function_declarations=declarations)]
+    Accepts two dict shapes (both are treated as equivalent):
+      1. Internal / pydantic_to_anthropic_tool shape:
+           {"name": str, "description": str, "input_schema": {...json-schema...}}
+      2. Raw-Google / SDK-friendly shape:
+           {"name": str, "description": str, "parameters": {...json-schema...}}
+
+    types.FunctionDeclaration instances are forwarded unchanged.
+
+    Raises ValueError for every malformed dict entry (missing name, or no
+    schema provided) rather than silently dropping parameters, which makes
+    the provider return only text instead of a function call.
+    """
+    _t = _types if _types is not None else _ensure_types()
+    declarations = []
+    for i, tool in enumerate(tools):
+        if isinstance(tool, _t.FunctionDeclaration):
+            declarations.append(tool)
+            continue
+        if not isinstance(tool, dict):
+            raise ValueError(
+                f"tool[{i}]: expected dict or types.FunctionDeclaration, "
+                f"got {type(tool).__name__!r}"
+            )
+        name = tool.get("name")
+        description = tool.get("description", "")
+        schema = tool.get("input_schema")
+        if schema is None and "parameters" in tool:
+            schema = tool["parameters"]
+        if not name or not isinstance(name, str):
+            raise ValueError(
+                f"tool[{i}]: 'name' (non-empty string) is required. "
+                f"Keys present: {sorted(tool.keys())!r}. "
+                f"Expected shape: {{'name','description','input_schema'}} "
+                f"or {{'name','description','parameters'}}."
+            )
+        if not isinstance(schema, dict) or not schema:
+            raise ValueError(
+                f"tool[{i}] ({name!r}): missing argument schema. "
+                f"Provide 'input_schema' (internal/anthropic shape) or "
+                f"'parameters' (raw-Google shape) as a non-empty JSON-schema "
+                f"dict. Keys present: {sorted(tool.keys())!r}."
+            )
+        declarations.append(_t.FunctionDeclaration(
+            name=name,
+            description=description,
+            parameters=schema,
+        ))
+
+    return [_t.Tool(function_declarations=declarations)]
 
 
 # Keep for backward compatibility with tool definition building

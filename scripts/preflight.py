@@ -41,6 +41,14 @@ def check_pytest_green(
     if run_pytest is None:
         def run_pytest() -> tuple[int, str]:
             env = {**os.environ, "MOCK_LLM": "1"}
+            for key in (
+                "OPEN_ROUTER_API_KEY",
+                "OPENROUTER_API_KEY",
+                "GEMINI_API_KEY",
+                "LLM_PROVIDER",
+                "CLINIC_DEBUG",
+            ):
+                env.pop(key, None)
             proc = subprocess.run(
                 ["uv", "run", "pytest", "-q", "-rs"],
                 cwd=str(ROOT),

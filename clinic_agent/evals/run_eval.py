@@ -25,7 +25,12 @@ from clinic_agent.evals.judge import format_transcript, judge_transcript
 from clinic_agent.evals.scenario_schema import Scenario
 from clinic_agent.evals.scorers import ScoreReport, score_judge, score_state, score_trace
 from clinic_agent.evals.simulator import build_sim_history, simulate_patient
-from clinic_agent.llm import FatalLLMError
+from clinic_agent.llm import (
+    FatalLLMError,
+    chat_role_label,
+    clear_provider_usage,
+    snapshot_provider_usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +99,8 @@ def run_scenario(
 
         # Agent turn
         try:
-            agent_response = run_turn(session, conn, policy_text, trace)
+            with chat_role_label("agent"):
+                agent_response = run_turn(session, conn, policy_text, trace)
         except FatalLLMError:
             raise  # Abort entire eval — typed fatal from llm.py
         except RuntimeError as e:
@@ -121,13 +127,14 @@ def run_scenario(
         # Patient simulator turn
         try:
             history = build_sim_history(sim_history)
-            patient_response = simulate_patient(
-                persona=scenario.patient_persona,
-                agent_message=agent_response,
-                conversation_history=history,
-                turn=turn,
-                max_turns=scenario.max_turns,
-            )
+            with chat_role_label("sim"):
+                patient_response = simulate_patient(
+                    persona=scenario.patient_persona,
+                    agent_message=agent_response,
+                    conversation_history=history,
+                    turn=turn,
+                    max_turns=scenario.max_turns,
+                )
         except FatalLLMError:
             raise
         except RuntimeError as e:
@@ -173,7 +180,8 @@ def run_scenario(
                 [{"role": m.role, "content": m.content, "tool_name": m.tool_name}
                  for m in session.messages]
             )
-            judge_results = judge_transcript(transcript_text, scenario.expect.judge)
+            with chat_role_label("judge"):
+                judge_results = judge_transcript(transcript_text, scenario.expect.judge)
             report.judge_checks = score_judge(judge_results)
         except FatalLLMError:
             raise
@@ -260,6 +268,9 @@ def run_eval(
     policy = load_policy(policy_path)
     p_hash = policy_hash(policy)
 
+    # Reset the per-role provider usage tracker before this run
+    clear_provider_usage()
+
     # Create run directory (mock runs go to runs/_mock/, real runs to runs/)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if llm_mode == "mock":
@@ -329,6 +340,21 @@ def run_eval(
 
         all_results[scenario.id] = scenario_results
 
+    # Snapshot provider usage after ALL scenario runs are complete
+    llm_providers_used = snapshot_provider_usage()
+
+    # In real mode, invalidate if any role used more than one distinct provider
+    if llm_mode == "real":
+        mixed_roles = {role for role, provs in llm_providers_used.items() if len(provs) > 1}
+        if mixed_roles:
+            print(f"\nFATAL: Some LLM roles used more than one provider in a single real run. "
+                  f"Mixed roles: {sorted(mixed_roles)} -> {llm_providers_used}")
+            print("Run is invalid. No results.json written. "
+                  "Set LLM_PROVIDER=openrouter or LLM_PROVIDER=gemini explicitly to avoid fallback mixing.")
+            import shutil
+            shutil.rmtree(run_dir, ignore_errors=True)
+            return {}
+
     # In real mode, if any infrastructure errors occurred, mark run invalid
     if llm_mode == "real" and infrastructure_errors > 0:
         print(f"\nFATAL: {infrastructure_errors} infrastructure error(s) occurred in real mode.")
@@ -340,7 +366,8 @@ def run_eval(
     # Aggregate
     results = _aggregate_results(
         all_results, scenarios, p_hash, timestamp, k,
-        llm_mode, agent_model, judge_model, sim_model
+        llm_mode, agent_model, judge_model, sim_model,
+        llm_providers_used=llm_providers_used,
     )
 
     # Save
@@ -371,6 +398,8 @@ def _aggregate_results(
     agent_model: str,
     judge_model: str,
     sim_model: str,
+    *,
+    llm_providers_used: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Compute aggregate scores from per-scenario results."""
     scenario_map = {s.id: s for s in scenarios}
@@ -418,6 +447,11 @@ def _aggregate_results(
         "agent_model": agent_model,
         "judge_model": judge_model,
         "sim_model": sim_model,
+        # Per-role list of providers actually used in this run.
+        # Mock runs produce {"agent":["mock"],"sim":["mock"],"judge":["mock"]} if those roles called chat().
+        # Real runs must have exactly one provider per role (e.g., {"agent":["gemini"],...}),
+        # or the run was already invalidated before reaching _aggregate_results.
+        "llm_providers_used": llm_providers_used or {},
         "overall": {
             "pass_rate": overall_pass / overall_total if overall_total else 0.0,
             "passed": overall_pass,
