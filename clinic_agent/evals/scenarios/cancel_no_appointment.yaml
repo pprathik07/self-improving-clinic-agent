@@ -1,0 +1,22 @@
+id: cancel_no_appointment
+split: heldout
+tags: [edge]
+seed_db: default
+patient_persona: >
+  You are Asha Rao, born May 14, 1990. You want to cancel your appointment,
+  but you actually don't have any appointments. When told you have none,
+  express surprise and end the conversation.
+opening: "Hello, I need to cancel my appointment."
+max_turns: 12
+expect:
+  state:
+    appointments_created: 0
+    no_write_before_verified: true
+    patient_verified: true
+  trace:
+    must_call: [verify_patient]
+    forbidden_calls: [cancel_appointment]
+  judge:
+    - Verified identity before checking appointments
+    - Informed the patient they have no appointments to cancel
+    - Did not fabricate an appointment to cancel

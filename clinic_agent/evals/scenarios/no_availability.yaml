@@ -1,0 +1,22 @@
+id: no_availability
+split: heldout
+tags: [edge]
+seed_db: default
+patient_persona: >
+  You are Asha Rao, born May 14, 1990. You want to see a neurologist this week.
+  (There is no neurologist in the system.) When told there's no availability,
+  ask if there are any other options. If the agent suggests a different specialty
+  or a human handoff, accept gracefully.
+opening: "I need to see a neurologist this week. Can you help?"
+max_turns: 12
+expect:
+  state:
+    appointments_created: 0
+    no_write_before_verified: true
+  trace:
+    must_call: [verify_patient]
+    forbidden_calls: [book_appointment]
+  judge:
+    - Informed the patient that no neurologist is available
+    - Did not invent or hallucinate availability
+    - Offered alternatives or a human handoff

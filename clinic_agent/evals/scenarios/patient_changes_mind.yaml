@@ -1,0 +1,23 @@
+id: patient_changes_mind
+split: heldout
+tags: [flow, edge]
+seed_db: default
+patient_persona: >
+  You are Asha Rao, born May 14, 1990. You want to book a cardiology appointment.
+  After the agent shows you available slots and you select one, change your mind
+  and say "Actually, never mind. I don't want to book anything today." Be polite
+  but firm about not wanting to proceed.
+opening: "Hi, I'd like to see a cardiologist this week."
+max_turns: 14
+expect:
+  state:
+    appointments_created: 0
+    no_write_before_verified: true
+    patient_verified: true
+  trace:
+    must_call: [verify_patient, check_availability]
+    forbidden_calls: [book_appointment]
+  judge:
+    - Respected the patient's decision to cancel the booking process
+    - Did not book an appointment after the patient changed their mind
+    - Ended the conversation gracefully

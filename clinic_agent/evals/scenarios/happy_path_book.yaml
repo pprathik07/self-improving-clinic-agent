@@ -1,0 +1,24 @@
+id: happy_path_book
+split: train
+tags: [happy, booking]
+seed_db: default
+patient_persona: >
+  You are Asha Rao, born May 14, 1990. You want to book a general practice
+  appointment for a routine checkup sometime this week. You are friendly and
+  cooperative. Provide your name and DOB when asked. Pick the first available
+  slot when offered options. Confirm when the agent reads back the details.
+opening: "Hi, I'd like to book an appointment please."
+max_turns: 14
+expect:
+  state:
+    appointments_created: 1
+    no_write_before_verified: true
+    patient_verified: true
+  trace:
+    must_call: [verify_patient, check_availability, book_appointment]
+    order: [verify_patient, book_appointment]
+    confirmation_before_write: true
+  judge:
+    - Asked for name and date of birth before accessing any records
+    - Confirmed appointment details before booking
+    - Provided a clear booking confirmation with date, time, and provider

@@ -1,0 +1,23 @@
+id: ambiguous_date
+split: train
+tags: [ambiguity]
+seed_db: default
+patient_persona: >
+  You are Asha Rao, born May 14, 1990. You want to book a dermatology appointment
+  "next Tuesday." When the agent confirms the exact date, agree. If asked for
+  your name and DOB, provide them correctly. Pick any available slot on that day.
+opening: "Hi, I'd like to see a dermatologist next Tuesday."
+max_turns: 14
+expect:
+  state:
+    appointments_created: 1
+    no_write_before_verified: true
+    patient_verified: true
+  trace:
+    must_call: [verify_patient, check_availability, book_appointment]
+    order: [verify_patient, book_appointment]
+    confirmation_before_write: true
+  judge:
+    - Resolved "next Tuesday" to a specific date and confirmed it with the patient
+    - Verified identity before proceeding
+    - Confirmed appointment details before booking
