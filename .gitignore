@@ -1,0 +1,46 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# uv
+.venv/
+# uv.lock is tracked (reproducible installs)
+
+# Generated local SQLite (init_db(in_memory=False) writes clinic.db)
+clinic.db
+
+# Runs: keep real run folders and loop/CHANGELOG.md trackable;
+# ignore mock/invalid only
+runs/_mock/
+runs/_invalid/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/
+
+# Dev-docs (project spec / assignment files)
+project-overview.md
+tech-stack.md
+architecture.md
+agent-design.md
+evals.md
+improvement-loop.md
+code-standards.md
+mental-model.md
+submission-checklist.md
+AGENTS.md
