@@ -10,9 +10,11 @@ import pytest
 from clinic_agent.llm import (
     FatalLLMError,
     _RATE_LIMIT_SLEEPS,
+    _SERVER_ERROR_SLEEPS,
     _generate_with_retries,
     _is_immediate_abort_error,
     _is_rate_limit_error,
+    _is_transient_server_error,
 )
 
 
@@ -273,3 +275,114 @@ expect:
         assert calls["n"] == 2
         # Real mode invalidates when infra errors occurred
         assert results == {}
+
+
+class TestServerErrorRetries:
+    """Tests for 5xx / timeout retry with sleep (5s, 15s, 30s)."""
+
+    def test_503_then_success_sleeps_5(self, monkeypatch):
+        """One 503 then success: exactly 1 sleep of 5s."""
+        sleeps: list[float] = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        calls = {"n": 0}
+
+        class Models:
+            def generate_content(self, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise FakeAPIError(503, "503 The service is temporarily unavailable")
+                return MagicMock()
+
+        client = SimpleNamespace(models=Models())
+        monkeypatch.setattr(
+            "clinic_agent.llm._parse_response",
+            lambda r: __import__("clinic_agent.llm", fromlist=["LLMResponse"]).LLMResponse(content="ok"),
+        )
+        result = _generate_with_retries(client, "m", contents=[], config=None)
+        assert result.content == "ok"
+        assert sleeps == [5]
+        assert calls["n"] == 2
+
+    def test_persistent_503_sleeps_5_15_30_then_fails(self, monkeypatch):
+        """503 on every call: sleeps [5, 15, 30] then RuntimeError."""
+        sleeps: list[float] = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        calls = {"n": 0}
+
+        class Models:
+            def generate_content(self, **kwargs):
+                calls["n"] += 1
+                raise FakeAPIError(503, "503 high demand")
+
+        client = SimpleNamespace(models=Models())
+        with pytest.raises(RuntimeError, match="server error after"):
+            _generate_with_retries(client, "m", contents=[], config=None)
+        assert sleeps == [5, 15, 30]
+        assert calls["n"] == 4  # 1 initial + 3 retries
+
+    def test_503_is_not_fatal_llm_error(self, monkeypatch):
+        """A 503 must raise RuntimeError, NOT FatalLLMError (which aborts the eval run)."""
+        sleeps: list[float] = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+
+        class Models:
+            def generate_content(self, **kwargs):
+                raise FakeAPIError(503, "503 UNAVAILABLE")
+
+        client = SimpleNamespace(models=Models())
+        with pytest.raises(RuntimeError) as exc_info:
+            _generate_with_retries(client, "m", contents=[], config=None)
+        assert not isinstance(exc_info.value, FatalLLMError)
+
+    def test_403_still_aborts_on_call_1_after_server_retry_changes(self, monkeypatch):
+        """403 must still abort immediately with no sleep, even after server retry changes."""
+        sleeps: list[float] = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        calls = {"n": 0}
+
+        class Models:
+            def generate_content(self, **kwargs):
+                calls["n"] += 1
+                raise FakeAPIError(403, "403 PERMISSION_DENIED")
+
+        client = SimpleNamespace(models=Models())
+        with pytest.raises(FatalLLMError, match="abort immediately"):
+            _generate_with_retries(client, "m", contents=[], config=None)
+        assert calls["n"] == 1
+        assert sleeps == []
+
+    def test_404_still_aborts_on_call_1_after_server_retry_changes(self, monkeypatch):
+        """404 must still abort immediately with no sleep."""
+        sleeps: list[float] = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        calls = {"n": 0}
+
+        class Models:
+            def generate_content(self, **kwargs):
+                calls["n"] += 1
+                raise FakeAPIError(404, "404 NOT_FOUND")
+
+        client = SimpleNamespace(models=Models())
+        with pytest.raises(FatalLLMError, match="abort immediately"):
+            _generate_with_retries(client, "m", contents=[], config=None)
+        assert calls["n"] == 1
+        assert sleeps == []
+
+    def test_502_is_transient(self):
+        """502 must be classified as transient server error."""
+        e = FakeAPIError(502, "502 Bad Gateway")
+        assert _is_transient_server_error(e, str(e))
+
+    def test_504_is_transient(self):
+        """504 must be classified as transient server error."""
+        e = FakeAPIError(504, "504 Gateway Timeout")
+        assert _is_transient_server_error(e, str(e))
+
+    def test_timeout_string_is_transient(self):
+        """Timeout in error string must be classified as transient."""
+        e = FakeAPIError(None, "Request timeout after 30s")
+        assert _is_transient_server_error(e, str(e))
+
+    def test_server_error_sleeps_tuple_value(self):
+        """Verify the sleep schedule constant."""
+        assert _SERVER_ERROR_SLEEPS == (5, 15, 30)

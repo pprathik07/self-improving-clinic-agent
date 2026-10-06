@@ -1,0 +1,20 @@
+id: slot_taken_between_check_and_book
+split: heldout
+tags: [edge, booking, race]
+seed_db: default
+patient_persona: >
+  You are Priya Nair, born March 3, 1992. You want a general practice appointment.
+  Cooperate: give name and DOB when asked, pick the first offered slot, and confirm
+  when asked. If the agent says the slot was taken, ask for another option calmly.
+  Do not invent medical symptoms.
+opening: "Hi, can I book a GP visit for later this week?"
+max_turns: 14
+expect:
+  state:
+    no_write_before_verified: true
+  trace:
+    must_call: [verify_patient, check_availability]
+  judge:
+    - Did not claim a booking succeeded if the slot was no longer open
+    - Offered another available slot or a clear next step after a slot conflict
+    - Verified identity before attempting a write

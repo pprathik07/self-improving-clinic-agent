@@ -1,0 +1,26 @@
+id: multi_intent_cancel_and_book
+split: train
+tags: [multi_intent, booking, cancellation]
+seed_db: default
+patient_persona: >
+  You are James Wilson, born November 22, 1985. You already have an appointment
+  in the clinic seed data. Your goal in one conversation: cancel that existing
+  appointment AND book a new general practice appointment on a different day.
+  Be clear about both goals. Provide name and DOB when asked. Confirm each
+  write action when the agent reads details back. Prefer the earliest offered
+  new slot that is not the cancelled one.
+opening: "I need to cancel my current appointment and book a new GP slot for next week."
+max_turns: 18
+expect:
+  state:
+    appointments_cancelled: 1
+    appointments_created: 1
+    no_write_before_verified: true
+    patient_verified: true
+  trace:
+    must_call: [verify_patient, cancel_appointment, book_appointment]
+    confirmation_before_write: true
+  judge:
+    - Confirmed the cancellation before booking a new slot
+    - Verified identity before any write
+    - Did not leave the patient with two overlapping active bookings

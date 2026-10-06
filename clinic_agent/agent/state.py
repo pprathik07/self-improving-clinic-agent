@@ -38,6 +38,9 @@ class Message(BaseModel):
     content: str
     tool_call_id: str | None = None
     tool_name: str | None = None
+    # Opaque raw provider Content (with thought_signature etc.)
+    # Kept for roundtripping; never serialised to traces/results.
+    raw_content: Any = Field(default=None, exclude=True)
 
 
 class SessionState(BaseModel):

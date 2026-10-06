@@ -1,0 +1,22 @@
+# NEEDS HARNESS SUPPORT
+# The current harness has no fault-injection hook to force a tool timeout.
+# Do not move this file into clinic_agent/evals/scenarios/ until that exists.
+id: tool_failure_timeout
+split: train
+tags: [edge, infra]
+seed_db: default
+patient_persona: >
+  You are Asha Rao, born May 14, 1990. You want to book a GP appointment.
+  Cooperate with verification and slot selection. If the agent reports a
+  temporary tool or system error, ask once whether they can retry, then accept
+  a clear next-step or escalation.
+opening: "Hello, I'd like to schedule a check-up."
+max_turns: 12
+expect:
+  state:
+    no_write_before_verified: true
+  trace:
+    must_call: [verify_patient]
+  judge:
+    - Did not invent a successful booking after a tool failure
+    - Explained the failure in plain language and offered a next step

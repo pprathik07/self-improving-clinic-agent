@@ -52,6 +52,9 @@ class LLMResponse(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     usage: dict[str, int] = Field(default_factory=dict)
     stop_reason: str = ""
+    # Opaque raw provider Content (with thought_signature etc.).
+    # Kept for roundtripping; never serialised to traces/results.
+    raw_content: Any = Field(default=None, exclude=True)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +100,11 @@ def _get_client() -> genai.Client:
 # Chat function
 # ---------------------------------------------------------------------------
 
+def _is_mock() -> bool:
+    """Check MOCK_LLM at call time, not import time."""
+    return os.environ.get("MOCK_LLM", "0") == "1"
+
+
 def chat(
     messages: list[dict[str, Any]],
     system: str = "",
@@ -119,9 +127,9 @@ def chat(
         Typed LLMResponse with content, tool calls, and usage.
 
     Raises:
-        RuntimeError on timeout or unrecoverable error (after 1 retry).
+        RuntimeError on timeout or unrecoverable error (after retries).
     """
-    if _USE_MOCK:
+    if _is_mock():
         return _mock_chat(messages, system, tools, model_key)
     client = _get_client()
     model = os.environ.get(model_key, "gemini-2.0-flash")
@@ -158,8 +166,65 @@ def _status_code(exc: BaseException) -> int | None:
     return None
 
 
+def _extract_quota_info(exc: BaseException) -> dict[str, Any]:
+    """Extract QuotaFailure and RetryInfo from error details."""
+    info: dict[str, Any] = {"quota_id": None, "retry_delay": None}
+    details = getattr(exc, "details", None)
+    if details is None:
+        return info
+    # Walk nested detail structures
+    candidates: list[Any] = []
+    if isinstance(details, dict):
+        candidates.append(details)
+        err = details.get("error")
+        if isinstance(err, dict):
+            for item in err.get("details") or []:
+                if isinstance(item, dict):
+                    candidates.append(item)
+        for item in details.get("details") or []:
+            if isinstance(item, dict):
+                candidates.append(item)
+    for obj in candidates:
+        atype = obj.get("@type", "")
+        if "QuotaFailure" in atype:
+            for v in obj.get("violations", []):
+                qid = v.get("quotaMetric") or v.get("quotaId") or ""
+                if qid:
+                    info["quota_id"] = qid
+        if "RetryInfo" in atype:
+            delay = obj.get("retryDelay")
+            if isinstance(delay, (int, float)):
+                info["retry_delay"] = float(delay)
+            elif isinstance(delay, str):
+                m = re.match(r"^(\d+(?:\.\d+)?)s?$", delay.strip())
+                if m:
+                    info["retry_delay"] = float(m.group(1))
+    return info
+
+
+def _is_per_day_quota(exc: BaseException, error_str: str) -> bool:
+    """True if this is a per-day quota exhaustion (abort immediately)."""
+    info = _extract_quota_info(exc)
+    qid = info.get("quota_id") or ""
+    if "PerDay" in qid:
+        return True
+    # Fallback: message says daily quota
+    if re.search(r"daily\s*quota|quota.*daily", error_str, re.I):
+        return True
+    return False
+
+
+def _is_per_minute_quota(exc: BaseException, error_str: str) -> tuple[bool, float | None]:
+    """True if per-minute quota. Returns (is_per_minute, retry_delay)."""
+    info = _extract_quota_info(exc)
+    qid = info.get("quota_id") or ""
+    if "PerMinute" in qid:
+        return True, info.get("retry_delay")
+    return False, None
+
+
 def _is_immediate_abort_error(exc: BaseException, error_str: str) -> bool:
-    """401/403/404/model-not-found/daily-quota/billing — abort, no retry."""
+    """401/403/404/model-not-found/per-day-quota — abort, no retry."""
     code = _status_code(exc)
     if code in (401, 403, 404):
         return True
@@ -168,11 +233,8 @@ def _is_immediate_abort_error(exc: BaseException, error_str: str) -> bool:
     s = error_str.upper()
     if any(m in s for m in (
         "PERMISSION_DENIED", "API_KEY", "UNAUTHENTICATED",
-        "MODEL_NOT_FOUND", "BILLING",
+        "MODEL_NOT_FOUND",
     )):
-        return True
-    # Daily quota / billing messages abort at once (not transient 429)
-    if re.search(r"daily\s*quota|quota.*daily|billing", error_str, re.I):
         return True
     if "NOT_FOUND" in s and re.search(r"\bmodel\b", error_str, re.I):
         return True
@@ -187,21 +249,24 @@ def _is_rate_limit_error(exc: BaseException, error_str: str) -> bool:
     if re.search(r"\b429\b", error_str):
         return True
     s = error_str.upper()
-    # Exclude daily-quota messages (those abort immediately)
-    if re.search(r"daily\s*quota|quota.*daily|billing", error_str, re.I):
-        return False
     return "RESOURCE_EXHAUSTED" in s or "RATE_LIMIT" in s
 
 
-def _is_transient_server_error(error_str: str) -> bool:
-    return (
-        "500" in error_str
-        or "503" in error_str
-        or "timeout" in error_str.lower()
-    )
+def _is_transient_server_error(exc: BaseException, error_str: str) -> bool:
+    """500/502/503/504 and timeouts — transient, retry with sleep."""
+    code = _status_code(exc)
+    if code in (500, 502, 503, 504):
+        return True
+    if re.search(r"\b(500|502|503|504)\b", error_str):
+        return True
+    if "timeout" in error_str.lower():
+        return True
+    s = error_str.upper()
+    return "INTERNAL" in s or "UNAVAILABLE" in s
 
 
 _RATE_LIMIT_SLEEPS = (10, 30, 60)
+_SERVER_ERROR_SLEEPS = (5, 15, 30)
 _RETRY_DELAY_CAP_S = 90
 
 
@@ -262,23 +327,36 @@ def _generate_with_retries(client: Any, model: str, contents: Any, config: Any) 
         except Exception as e:
             error_str = str(e)
 
-            if _is_immediate_abort_error(e, error_str):
-                raise FatalLLMError(
-                    f"LLM API fatal error (abort immediately): {e}. "
-                    f"Check your GEMINI_API_KEY and model IDs in .env. "
-                    f"Set MOCK_LLM=1 for testing without an API key."
-                ) from e
-
+            # --- 429 / rate limit: check BEFORE abort (429 messages contain
+            # "billing" which would falsely trigger abort) ---
             if _is_rate_limit_error(e, error_str):
+                # Per-day quota → fatal immediately
+                if _is_per_day_quota(e, error_str):
+                    raise FatalLLMError(
+                        f"LLM API per-day quota exhausted (abort): {e}"
+                    ) from e
+
                 if rate_failures >= 3:
                     raise FatalLLMError(
                         f"LLM API rate limit exhausted after retries: {e}"
                     ) from e
-                hinted = _extract_retry_delay_seconds(e)
-                if hinted is not None:
-                    delay = min(float(hinted), float(_RETRY_DELAY_CAP_S))
+
+                # Per-minute quota → sleep retryDelay + 1s
+                is_pm, pm_delay = _is_per_minute_quota(e, error_str)
+                if is_pm and pm_delay is not None:
+                    delay = min(pm_delay + 1.0, float(_RETRY_DELAY_CAP_S))
                 else:
-                    delay = float(_RATE_LIMIT_SLEEPS[rate_failures])
+                    # Generic 429: try retryDelay, else fallback schedule
+                    hinted = _extract_retry_delay_seconds(e)
+                    if hinted is not None:
+                        if hinted > _RETRY_DELAY_CAP_S:
+                            raise FatalLLMError(
+                                f"LLM API retry delay {hinted}s exceeds cap: {e}"
+                            ) from e
+                        delay = min(float(hinted), float(_RETRY_DELAY_CAP_S))
+                    else:
+                        delay = float(_RATE_LIMIT_SLEEPS[rate_failures])
+
                 logger.warning(
                     "Rate limit (failure %d/3), sleeping %ss: %s",
                     rate_failures + 1, delay, e,
@@ -288,14 +366,29 @@ def _generate_with_retries(client: Any, model: str, contents: Any, config: Any) 
                 last_error = e
                 continue
 
-            if _is_transient_server_error(error_str):
-                if server_failures >= 1:
+            # --- 401/403/404 / model-not-found → abort on call 1 ---
+            if _is_immediate_abort_error(e, error_str):
+                raise FatalLLMError(
+                    f"LLM API fatal error (abort immediately): {e}. "
+                    f"Check your GEMINI_API_KEY and model IDs in .env. "
+                    f"Set MOCK_LLM=1 for testing without an API key."
+                ) from e
+
+            # --- 5xx / timeout → retry with sleep ---
+            if _is_transient_server_error(e, error_str):
+                if server_failures >= len(_SERVER_ERROR_SLEEPS):
                     raise RuntimeError(
-                        f"LLM call failed after 2 attempts: {last_error or e}"
+                        f"LLM server error after {server_failures + 1} attempts "
+                        f"(slept {list(_SERVER_ERROR_SLEEPS)}s): {last_error or e}"
                     ) from e
+                delay = _SERVER_ERROR_SLEEPS[server_failures]
                 server_failures += 1
                 last_error = e
-                logger.warning("LLM server error (attempt %d/2): %s", server_failures, e)
+                logger.warning(
+                    "LLM server error (attempt %d/%d), sleeping %ds: %s",
+                    server_failures, len(_SERVER_ERROR_SLEEPS) + 1, delay, e,
+                )
+                time.sleep(delay)
                 continue
 
             raise
@@ -346,11 +439,15 @@ def _parse_response(response: Any) -> LLMResponse:
     if hasattr(candidate, "finish_reason") and candidate.finish_reason:
         stop_reason = str(candidate.finish_reason)
 
+    # Preserve raw Content for roundtripping (thought_signature etc.)
+    raw = candidate.content if (candidate.content and candidate.content.parts) else None
+
     return LLMResponse(
         content="\n".join(content_parts),
         tool_calls=tool_calls,
         usage=usage,
         stop_reason=stop_reason,
+        raw_content=raw,
     )
 
 
@@ -398,7 +495,12 @@ def _to_gemini_contents(messages: list[dict[str, Any]]) -> list[types.Content]:
                 ))
 
         elif role == "assistant":
-            if isinstance(content, list):
+            # If we have the raw provider Content, send it verbatim
+            # (preserves thought_signature and other opaque fields)
+            raw = msg.get("_raw_content")
+            if raw is not None:
+                contents.append(raw)
+            elif isinstance(content, list):
                 # Content blocks (may include tool_use)
                 parts = []
                 for block in content:

@@ -198,6 +198,7 @@ def _handle_tool_calls(
         role="assistant",
         content=response.content or "",
         tool_name=response.tool_calls[0].name if response.tool_calls else None,
+        raw_content=response.raw_content,
     ))
 
     # Add tool results to history
@@ -339,7 +340,11 @@ def _to_api_messages(messages: list[Message]) -> list[dict[str, Any]]:
             if not content_blocks:
                 content_blocks.append({"type": "text", "text": ""})
 
-            api_msgs.append({"role": "assistant", "content": content_blocks})
+            api_msg: dict[str, Any] = {"role": "assistant", "content": content_blocks}
+            # Carry raw provider Content for roundtripping (thought_signature)
+            if msg.raw_content is not None:
+                api_msg["_raw_content"] = msg.raw_content
+            api_msgs.append(api_msg)
 
             # Add tool results as a user message (Anthropic format)
             if tool_results:
