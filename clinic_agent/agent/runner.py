@@ -270,6 +270,10 @@ def _handle_tool_calls(
             tool_name=response.tool_calls[i].name,
         ))
 
+    # verify_patient lands in VERIFIED; if the patient already stated intent
+    # (same message or earlier), advance so booking tools are allowed next.
+    _maybe_transition_after_verification(session)
+
     # After processing tool results, call the LLM again to get a natural language response
     api_messages = _to_api_messages(session.messages)
     system = _build_system_prompt(policy_text, session)
@@ -520,6 +524,54 @@ def run_interactive(policy_path: str | None = None) -> None:
         print(f"\n[Conversation ended — state: {session.state.value}]")
 
 
+def _intent_from_text(text: str) -> str | None:
+    """Return book|cancel|reschedule if text expresses a clinic intent, else None."""
+    lower = text.lower()
+    if not any(
+        word in lower
+        for word in [
+            "book",
+            "schedule",
+            "appointment",
+            "see",
+            "visit",
+            "cancel",
+            "reschedule",
+            "change",
+            "move",
+        ]
+    ):
+        return None
+    if "cancel" in lower:
+        return "cancel"
+    if any(w in lower for w in ["reschedule", "change", "move"]):
+        return "reschedule"
+    return "book"
+
+
+def _maybe_advance_verified_to_intent(session: SessionState, user_input: str) -> None:
+    """VERIFIED → INTENT when this message states what the patient wants."""
+    if session.state != AgentState.VERIFIED:
+        return
+    intent = _intent_from_text(user_input)
+    if intent is None:
+        return
+    session.state = AgentState.INTENT
+    session.intent = intent
+
+
+def _maybe_transition_after_verification(session: SessionState) -> None:
+    """After verify lands in VERIFIED, advance if any earlier/current user msg has intent."""
+    if session.state != AgentState.VERIFIED:
+        return
+    for msg in session.messages:
+        if msg.role != "user" or not msg.content:
+            continue
+        _maybe_advance_verified_to_intent(session, msg.content)
+        if session.state == AgentState.INTENT:
+            return
+
+
 def _maybe_transition_from_user_input(session: SessionState, user_input: str) -> None:
     """Evaluate if user input should trigger a state transition.
 
@@ -530,15 +582,7 @@ def _maybe_transition_from_user_input(session: SessionState, user_input: str) ->
 
     # From VERIFIED -> INTENT when patient states what they want
     if session.state == AgentState.VERIFIED:
-        if any(word in lower for word in ["book", "schedule", "appointment", "see", "visit",
-                                           "cancel", "reschedule", "change", "move"]):
-            session.state = AgentState.INTENT
-            if any(w in lower for w in ["cancel"]):
-                session.intent = "cancel"
-            elif any(w in lower for w in ["reschedule", "change", "move"]):
-                session.intent = "reschedule"
-            else:
-                session.intent = "book"
+        _maybe_advance_verified_to_intent(session, user_input)
 
     # From GREETING -> IDENTIFY (patient starts talking)
     elif session.state == AgentState.GREETING:
