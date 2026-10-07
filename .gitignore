@@ -16,8 +16,7 @@ build/
 # Generated local SQLite (init_db(in_memory=False) writes clinic.db)
 clinic.db
 
-# Runs: keep real run folders and loop/CHANGELOG.md trackable;
-# ignore mock/invalid only
+# Runs: ignore mock/invalid only
 runs/_mock/
 runs/_invalid/
 
@@ -33,21 +32,5 @@ Thumbs.db
 # pytest
 .pytest_cache/
 
-# Dev-docs (project spec / assignment files)
-project-overview.md
-tech-stack.md
-architecture.md
-agent-design.md
-evals.md
-improvement-loop.md
-code-standards.md
-mental-model.md
-submission-checklist.md
-AGENTS.md
-AI_USAGE.md
-CHECKLIST.md
-README.md
-.agents
-decisions.md
-design-note.md
-loop/CHANGELOG.md
+# Local / assignment docs (not for submission)
+dev-docs/
