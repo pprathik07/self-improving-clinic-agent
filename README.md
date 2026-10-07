@@ -32,28 +32,21 @@ no network, mock LLM).
 
 ## Status (read this first)
 
-**The agent, eval harness and improvement loop are built and tested. I have not completed
-a real before/after run, so this repo contains no measured scores.**
+**Agent, eval harness, and improvement loop are built.** Real Gemini evals at `k=1`
+(see Results). Best current score after a state-machine fix: **11/15 (73%)** on
+`policy_v1`. An earlier v1→v2 policy patch was **gate-rejected** and rolled back.
+No mock numbers are reported as scores.
 
-What is verified:
+What else is verified:
 
-- 305 passing tests, 0 skipped, run with mock LLMs and no network.
-- Hand-run mutation checks on the policy-patch validator: 11 guards, 0 untested.
-- Frozen scenario, scorer and policy hashes (`scripts/freeze_manifest.py --check` passes).
-- One live end-to-end booking on a real model: identity verified, slot found, explicit
-  confirmation, appointment written and confirmed in the database.
+- 305 passing tests, 0 skipped, mock LLM / no network.
+- Mutation checks on the policy-patch validator: 11 guards, 0 untested.
+- Frozen scenario, scorer and policy hashes (`scripts/freeze_manifest.py --check`).
+- One live booking on a real model (verify → slot → confirm → DB write).
 
-What is not verified: the improvement loop (reflector, patch, re-run, gate) has only been
-exercised with fake LLMs.
-
-Why there is no baseline: every real attempt was cut off by free-tier provider limits.
-OpenRouter free models allowed 50 requests/day and 20/minute; the Gemini judge model allowed
-5/minute and 20/day; another Gemini model returned 503 demand spikes. One baseline needs
-several hundred model calls. With enough quota it is one command:
+Limits: `k=1` only (quota). A stronger baseline is:
 
     uv run python -m clinic_agent.evals policy/policy_v1.yaml 3
-
-No mock-LLM number is reported as a result anywhere in this repo.
 
 ## How it works
 
@@ -98,7 +91,13 @@ retry delay, up to 3 times.
 ## Results
 
 <!-- RESULTS:START -->
-PENDING
+Real Gemini evals, `k=1`. Models: agent `gemini-3.1-flash-lite`, judge `gemini-3.6-flash`, sim `gemini-3.5-flash-lite`.
+
+| Run | Code | Policy | Result |
+|---|---|---|---|
+| `012952` | original | v1 | **10/15** (train 7/9, heldout 3/6) |
+| `015628` | original | v2 | **8/15**, gate rejected (rolled back) |
+| `021916` | state fix | v1 | **11/15** (train 6/9, heldout 5/6); judge parse failures on `ambiguous_date`, `medical_advice` |
 <!-- RESULTS:END -->
 
 ## Verification
