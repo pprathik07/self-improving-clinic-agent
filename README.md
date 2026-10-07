@@ -5,6 +5,18 @@ harness and an improvement loop. When a scenario fails, a reflector proposes a s
 validated patch to the agent's policy text. The same scenarios are re-run, and a gate
 accepts the patch or rolls it back.
 
+## Tech stack
+
+| | |
+|---|---|
+| **Language** | Python 3.12 · Pydantic v2 · YAML policy |
+| **Runtime** | `uv` · Makefile CLIs · pytest (305 tests, mock LLM) |
+| **Agent** | Explicit state machine + tool loop (no LangGraph/CrewAI) |
+| **Data** | SQLite (seeded clinic DB; scorers use ground truth) |
+| **LLM** | Thin `llm.py` adapter · OpenRouter / Gemini · 4 env-selected roles |
+| **Evals** | 15 YAML scenarios · DB/trace/judge scorers · heldout set |
+| **Loop** | Reflector → validated policy patch → regression gate |
+
 ## Run it
 
     git clone https://github.com/pprathik07/self-improving-clinic-agent
@@ -15,7 +27,7 @@ accepts the patch or rolls it back.
     make agent      # talk to the agent:        uv run python -m clinic_agent
     make improve    # run the improvement loop: uv run python -m clinic_agent.loop.improve
 
-Also available: `make eval` (score the current policy) and `make test` (302 tests,
+Also available: `make eval` (score the current policy) and `make test` (305 tests,
 no network, mock LLM).
 
 ## Status (read this first)
@@ -25,7 +37,7 @@ a real before/after run, so this repo contains no measured scores.**
 
 What is verified:
 
-- 302 passing tests, 0 skipped, run with mock LLMs and no network.
+- 305 passing tests, 0 skipped, run with mock LLMs and no network.
 - Hand-run mutation checks on the policy-patch validator: 11 guards, 0 untested.
 - Frozen scenario, scorer and policy hashes (`scripts/freeze_manifest.py --check` passes).
 - One live end-to-end booking on a real model: identity verified, slot found, explicit
@@ -91,7 +103,7 @@ PENDING
 
 ## Verification
 
-    make test                              # 302 tests, mock LLM
+    make test                              # 305 tests, mock LLM
     uv run python scripts/mutation_check.py   # patch.py guards: each must have a failing test
     uv run python scripts/freeze_manifest.py --check
     uv run python scripts/preflight.py --pre-real
@@ -112,6 +124,86 @@ A caught mutation proves that some test fails, not that the test is precise.
   specialty-only query did return. Date scenarios may fail for reasons no policy patch can fix.
 - Not production-ready: no UI, synthetic data only.
 
+## Architecture
+
+```mermaid
+flowchart TD
+
+subgraph group_scheduling["Scheduling Agent"]
+  node_runner["Conversation Runner<br/>runner.py"]
+  node_machine["State Machine<br/>machine.py"]
+  node_session["Session State<br/>state.py"]
+  node_policy_loader["Policy Loader<br/>policy.py"]
+  node_policy_data["Policy Rules<br/>policy_v1.yaml"]
+  node_llm["LLM Adapter<br/>llm.py"]
+end
+
+subgraph group_clinic["Clinic Domain"]
+  node_tools["Scheduling Tools<br/>impl.py"]
+  node_guards["Safety Guards<br/>guards.py"]
+  node_db[("Clinic Database<br/>db.py")]
+  node_models["Clinic Models<br/>models.py"]
+end
+
+subgraph group_evaluation["Evaluation Harness"]
+  node_eval_runner["Scenario Eval Runner<br/>run_eval.py"]
+  node_scenario_schema["Scenario Schema<br/>scenario_schema.py"]
+  node_simulator["Patient Simulator<br/>simulator.py"]
+  node_scorers["State And Trace Scorers<br/>scorers.py"]
+  node_judge["LLM Judge<br/>judge.py"]
+  node_failures["Failure Reports<br/>failures.py"]
+  node_report["Results Report<br/>report.py"]
+end
+
+subgraph group_improvement["Policy Improvement"]
+  node_improve["Improvement Orchestrator<br/>improve.py"]
+  node_reflector["Failure Reflector<br/>reflector.py"]
+  node_patch["Patch Validator<br/>patch.py"]
+  node_gate["Regression Gate<br/>gate.py"]
+end
+
+node_patient(("Patient"))
+
+node_patient -->|"converses with"| node_runner
+node_runner -->|"loads policy"| node_policy_loader
+node_policy_loader -->|"reads rules"| node_policy_data
+node_runner -->|"checks transitions"| node_machine
+node_runner -->|"tracks conversation"| node_session
+node_runner -->|"requests responses"| node_llm
+node_runner -->|"dispatches tool calls"| node_tools
+node_tools -->|"applies checks"| node_guards
+node_tools -->|"reads and writes"| node_db
+node_guards -->|"checks ownership and slots"| node_db
+node_db -->|"uses domain types"| node_models
+node_eval_runner -->|"loads scenarios"| node_scenario_schema
+node_eval_runner -->|"runs patient turns"| node_simulator
+node_eval_runner -->|"executes conversations"| node_runner
+node_eval_runner -->|"scores outcomes"| node_scorers
+node_eval_runner -->|"requests assessment"| node_judge
+node_eval_runner -->|"records failures"| node_failures
+node_simulator -->|"generates patient turns"| node_llm
+node_judge -->|"requests judgment"| node_llm
+node_improve -->|"runs evaluations"| node_eval_runner
+node_improve -->|"prepares failure summaries"| node_failures
+node_improve -->|"requests patch proposal"| node_reflector
+node_reflector -->|"produces structured patch"| node_patch
+node_improve -->|"validates patch"| node_patch
+node_patch -->|"writes policy sections"| node_policy_data
+node_improve -->|"checks regression results"| node_gate
+node_improve -->|"renders comparison"| node_report
+
+classDef toneBlue fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
+classDef toneAmber fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#78350f
+classDef toneMint fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
+classDef toneRose fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#881337
+classDef toneIndigo fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#312e81
+class node_runner,node_machine,node_session,node_policy_loader,node_policy_data,node_llm toneBlue
+class node_tools,node_guards,node_db,node_models toneAmber
+class node_eval_runner,node_scenario_schema,node_simulator,node_scorers,node_judge,node_failures,node_report toneMint
+class node_improve,node_reflector,node_patch,node_gate toneRose
+class node_patient toneIndigo
+```
+
 ## Layout
 
     clinic_agent/
@@ -125,5 +217,4 @@ A caught mutation proves that some test fails, not that the test is precise.
     scripts/     mutation_check, freeze_manifest, smoke_llm, preflight
     tests/
 
-See `design-note.md` for design choices and `AI_USAGE.md` for where AI helped and where I
-overrode it.
+See `design-note.md` for design choices.
